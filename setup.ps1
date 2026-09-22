@@ -56,19 +56,53 @@ function Get-PythonVersion {
 
 function Test-PythonDeps {
     if (-not $script:PyExe) { return $false }
-    Invoke-Py "-c" "import fastapi, uvicorn, pydantic, httpx, playwright" *> $null
-    return ($LASTEXITCODE -eq 0)
+    # Un import fallido ensucia stderr y, con ErrorActionPreference=Stop en
+    # PS 5.1, abortaria el script en vez de devolver $false (instalacion
+    # limpia => dependencias ausentes). Se degrada a Continue y se captura.
+    $prev = $ErrorActionPreference
+    $ready = $false
+    try {
+        $ErrorActionPreference = "Continue"
+        Invoke-Py "-c" "import fastapi, uvicorn, pydantic, httpx, playwright" *> $null
+        $ready = ($LASTEXITCODE -eq 0)
+    } catch {
+        $ready = $false
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $ready
 }
 
 function Test-DockerReady {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $false }
-    docker info *> $null
-    return ($LASTEXITCODE -eq 0)
+    # Docker Desktop apagado escribe el error en stderr; en PS 5.1 con
+    # ErrorActionPreference=Stop eso lanzaria NativeCommandError y abortaria
+    # el setup. Se degrada a Continue y se devuelve $false para poder caer a
+    # modo local.
+    $prev = $ErrorActionPreference
+    $ready = $false
+    try {
+        $ErrorActionPreference = "Continue"
+        docker info *> $null
+        $ready = ($LASTEXITCODE -eq 0)
+    } catch {
+        $ready = $false
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $ready
 }
 
 function Resolve-Compose {
-    docker compose version *> $null
-    if ($LASTEXITCODE -eq 0) { $script:ComposePlugin = $true; return $true }
+    $prev = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        docker compose version *> $null
+        if ($LASTEXITCODE -eq 0) { $script:ComposePlugin = $true; return $true }
+    } catch {
+    } finally {
+        $ErrorActionPreference = $prev
+    }
     if (Get-Command docker-compose -ErrorAction SilentlyContinue) {
         $script:ComposePlugin = $false; return $true
     }
@@ -93,21 +127,58 @@ function Wait-Bridge([int]$BridgePort, [int]$TimeoutSec = 60) {
     return $false
 }
 
-function Invoke-Login([string]$UserDataDir) {
-    $marker = Join-Path $UserDataDir ".pplx_login_ok"
-    if ((Test-Path -LiteralPath $marker) -and (-not $ForceLogin)) {
-        Write-Ok "Sesion de Perplexity ya inicializada ($marker)."
-        return $true
+function Get-BridgeProfileDir {
+    # Perfil efectivo que usaran 'core_bridge.cli start' y el servidor:
+    # PPLX_USER_DATA_DIR si esta definido; si no, el perfil aislado por
+    # navegador (p. ej. %LOCALAPPDATA%\PplxProfile\.profile_brave). No se
+    # fija ninguna ruta: la resuelve core_bridge.browser.USER_DATA_DIR.
+    if (-not $script:PyExe) { return $null }
+    $prev = $ErrorActionPreference
+    $dir = $null
+    try {
+        $ErrorActionPreference = "Continue"
+        $raw = (& $script:PyExe @($script:PyPre + @(
+            "-c",
+            "from core_bridge.browser import USER_DATA_DIR; print(USER_DATA_DIR)"
+        )) 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $raw) { $dir = $raw }
+    } catch {
+        $dir = $null
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $dir
+}
+
+function Invoke-Login {
+    # Login guiado en el perfil efectivo del bridge. No impone rutas fijas:
+    # 'python -m core_bridge.cli login' resuelve PPLX_USER_DATA_DIR o el
+    # perfil aislado por navegador y escribe alli el marcador de sesion.
+    $profileDir = Get-BridgeProfileDir
+    if ($profileDir) {
+        $marker = Join-Path $profileDir ".pplx_login_ok"
+        if ((Test-Path -LiteralPath $marker) -and (-not $ForceLogin)) {
+            Write-Ok "Sesion de Perplexity ya inicializada ($marker)."
+            return $true
+        }
     }
     if (-not (Test-PythonDeps)) {
         Write-Warn2 "No hay Python+Playwright locales para abrir la ventana de login."
         Write-Host "        Ejecuta primero: .\setup.ps1 -Mode local (o instala deps y repite)."
         return $false
     }
-    Write-Step "Login guiado (una sola vez) - perfil: $UserDataDir"
-    Invoke-Py "-m" "core_bridge.cli" "login" "--user-data-dir" $UserDataDir
+    if ($profileDir) {
+        Write-Step "Login guiado (una sola vez) - perfil: $profileDir"
+    } else {
+        Write-Step "Login guiado (una sola vez) - perfil: por defecto de core_bridge"
+    }
+    if ($ForceLogin) {
+        Invoke-Py "-m" "core_bridge.cli" "login" "--force"
+    } else {
+        Invoke-Py "-m" "core_bridge.cli" "login"
+    }
     if ($LASTEXITCODE -ne 0) {
-        Write-Warn2 "Login no confirmado. Puedes repetirlo con: python -m core_bridge.cli login --user-data-dir `"$UserDataDir`""
+        Write-Warn2 "Login no confirmado. Puedes repetirlo con: python -m core_bridge.cli login"
         return $false
     }
     return $true
@@ -174,46 +245,58 @@ if ($Mode -eq "auto") {
 if ($Mode -eq "docker") {
     Write-Step "Comprobando Docker"
     if (-not (Test-DockerReady)) {
-        Write-Err2 "Docker no esta instalado o el daemon no responde. Arranca Docker Desktop y repite."
-        exit 1
-    }
-    if (-not (Resolve-Compose)) {
-        Write-Err2 "No se encontro 'docker compose' ni 'docker-compose'."
-        exit 1
-    }
-    Write-Ok "Docker listo."
-
-    New-Item -ItemType Directory -Path "profile" -Force | Out-Null
-    Add-DockerEnvFile
-
-    $profilePath = Join-Path $Root "profile"
-    if (-not (Invoke-Login $profilePath)) {
-        Write-Warn2 "El contenedor arrancara igualmente; sin login las consultas a Perplexity fallaran."
-    }
-
-    Write-Step "Levantando contenedor (puerto $Port)"
-    if ($NoBuild) { Invoke-Compose "up" "-d" } else { Invoke-Compose "up" "-d" "--build" }
-    if ($LASTEXITCODE -ne 0) { Write-Err2 "docker compose up fallo."; exit 1 }
-
-    if (Wait-Bridge -BridgePort $Port -TimeoutSec 90) {
-        Write-Ok "Bridge respondiendo en http://127.0.0.1:$Port/health"
+        Write-Warn2 "Docker no esta instalado o el daemon no responde; se continua en modo local."
+        $Mode = "local"
+    } elseif (-not (Resolve-Compose)) {
+        Write-Warn2 "No se encontro 'docker compose' ni 'docker-compose'; se continua en modo local."
+        $Mode = "local"
     } else {
-        Write-Warn2 "El bridge aun no responde. Revisa logs: docker compose logs -f"
+        Write-Ok "Docker listo."
+
+        New-Item -ItemType Directory -Path "profile" -Force | Out-Null
+        Add-DockerEnvFile
+
+        # El contenedor monta ./profile como PPLX_USER_DATA_DIR (/data/profile):
+        # el login del host debe escribir en ese mismo perfil. Se exporta solo
+        # durante el login y se restaura el valor previo del entorno.
+        Find-Python | Out-Null
+        $savedUserDataDir = $env:PPLX_USER_DATA_DIR
+        $env:PPLX_USER_DATA_DIR = (Join-Path $Root "profile")
+        try {
+            if (-not (Invoke-Login)) {
+                Write-Warn2 "El contenedor arrancara igualmente; sin login las consultas a Perplexity fallaran."
+            }
+        } finally {
+            if ($null -ne $savedUserDataDir) { $env:PPLX_USER_DATA_DIR = $savedUserDataDir }
+            else { Remove-Item Env:\PPLX_USER_DATA_DIR -ErrorAction SilentlyContinue }
+        }
+
+        Write-Step "Levantando contenedor (puerto $Port)"
+        if ($NoBuild) { Invoke-Compose "up" "-d" } else { Invoke-Compose "up" "-d" "--build" }
+        if ($LASTEXITCODE -ne 0) { Write-Err2 "docker compose up fallo."; exit 1 }
+
+        if (Wait-Bridge -BridgePort $Port -TimeoutSec 90) {
+            Write-Ok "Bridge respondiendo en http://127.0.0.1:$Port/health"
+        } else {
+            Write-Warn2 "El bridge aun no responde. Revisa logs: docker compose logs -f"
+        }
+        Write-Host ""
+        Write-Host "Siguientes pasos:" -ForegroundColor Green
+        Write-Host "  1. Auditar:  .\pplx-audit.bat --files src/engine/trie.py --prompt `"PUNTAJE: [X]/100 ...`""
+        Write-Host "  2. Logs:     docker compose logs -f"
+        Write-Host "  3. Parar:    docker compose down"
+        exit 0
     }
-    Write-Host ""
-    Write-Host "Siguientes pasos:" -ForegroundColor Green
-    Write-Host "  1. Auditar:  .\pplx-audit.bat --files src/engine/trie.py --prompt `"PUNTAJE: [X]/100 ...`""
-    Write-Host "  2. Logs:     docker compose logs -f"
-    Write-Host "  3. Parar:    docker compose down"
-    exit 0
 }
 
 # Modo local
+Write-Step "Modo local"
 Install-LocalDeps
-$localProfile = Join-Path $Root "tools\pplx_bridge\.profile"
-if (-not (Invoke-Login $localProfile)) {
+if (-not (Invoke-Login)) {
     Write-Warn2 "Sin login el bridge arrancara pero Perplexity pedira autenticacion."
 }
+$localProfile = Get-BridgeProfileDir
+if (-not $localProfile) { $localProfile = "por defecto de core_bridge" }
 $env:PPLX_PORT = "$Port"
 Show-LocalNextSteps $localProfile
 exit 0

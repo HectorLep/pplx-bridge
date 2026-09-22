@@ -39,6 +39,31 @@ CHROMIUM_LAUNCH_ARGS = [
 ]
 
 
+def _close_quietly(target) -> None:
+    """Cierra un contexto de Playwright ignorando errores de cierre."""
+    try:
+        if target is not None:
+            target.close()
+    except Exception:  # noqa: BLE001 - cierre best-effort
+        pass
+
+
+def _stop_playwright(pw) -> None:
+    """Detiene el driver de Playwright sin propagar errores de tuberia.
+
+    Si el usuario cancela con Ctrl+C, el subproceso Node del driver recibe
+    tambien la senal y puede cerrar sus tuberias antes de que Python lo
+    detenga; las escrituras a esa tuberia rota (EPIPE) se ignoran para no
+    ensuciar la consola con un error no capturado.
+    """
+    if pw is None:
+        return
+    try:
+        pw.stop()
+    except Exception:  # noqa: BLE001 - cierre best-effort
+        pass
+
+
 def _cmd_login(args: argparse.Namespace) -> int:
     from .browser import (
         LOGIN_MARKER_NAME,
@@ -100,19 +125,14 @@ def _cmd_login(args: argparse.Namespace) -> int:
     }
     if executable:
         launch_kwargs["executable_path"] = executable
-    with sync_playwright() as pw:
+
+    pw = None
+    context = None
+    try:
+        pw = sync_playwright().start()
         context = pw.chromium.launch_persistent_context(
             str(user_data_dir), **launch_kwargs
         )
-
-        def close_context() -> None:
-            # El usuario puede cerrar la ventana manualmente: close() lanzaria
-            # TargetClosedError y enmascararia el resultado real del login.
-            try:
-                context.close()
-            except Exception:  # noqa: BLE001
-                pass
-
         page = context.pages[0] if context.pages else context.new_page()
         page.set_default_navigation_timeout(LOGIN_TIMEOUT_MS)
         try:
@@ -130,16 +150,24 @@ def _cmd_login(args: argparse.Namespace) -> int:
                 "comando manualmente en una terminal.",
                 file=sys.stderr,
             )
-            close_context()
             return 1
         except KeyboardInterrupt:
             print(
                 "\n[core_bridge] Cancelado por el usuario.",
                 file=sys.stderr,
             )
-            close_context()
             return 1
-        close_context()
+    except KeyboardInterrupt:
+        # Ctrl+C durante el arranque/navegacion: se sale limpio sin traceback.
+        print("\n[core_bridge] Cancelado por el usuario.", file=sys.stderr)
+        return 1
+    finally:
+        # Cerrar contexto y SIEMPRE detener el driver de Playwright antes de
+        # salir de la funcion: si Python termina mientras el driver Node sigue
+        # vivo, este escribe en la tuberia cerrada y emite el error no
+        # capturado 'EPIPE: broken pipe, write'.
+        _close_quietly(context)
+        _stop_playwright(pw)
 
     if answer in {"s", "si", "sí", "y", "yes"}:
         marker.write_text("ok\n", encoding="utf-8")
@@ -230,7 +258,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        # Ultimo recurso (p. ej. Ctrl+C fuera del flujo de login): salida
+        # limpia y codigo convencional 130 en vez de traceback.
+        print("\n[core_bridge] Cancelado por el usuario.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

@@ -56,6 +56,11 @@ python_deps_ok() {
   "$PY" -c "import fastapi, uvicorn, pydantic, httpx, playwright" >/dev/null 2>&1
 }
 
+bridge_profile_dir() {
+  [ -n "$PY" ] || return 1
+  "$PY" -c "from core_bridge.browser import USER_DATA_DIR; print(USER_DATA_DIR)" 2>/dev/null
+}
+
 docker_ready() {
   command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
 }
@@ -87,10 +92,13 @@ wait_bridge() {
 }
 
 login() {
-  local user_data_dir="$1"
-  local marker="${user_data_dir}/.pplx_login_ok"
-  if [ -f "$marker" ] && [ "$FORCE_LOGIN" -eq 0 ]; then
-    ok "Sesion de Perplexity ya inicializada ($marker)."
+  # Login guiado en el perfil efectivo del bridge. No impone rutas fijas:
+  # 'python -m core_bridge.cli login' resuelve PPLX_USER_DATA_DIR o el
+  # perfil aislado por navegador y escribe alli el marcador de sesion.
+  local user_data_dir=""
+  user_data_dir="$(bridge_profile_dir || true)"
+  if [ -n "$user_data_dir" ] && [ -f "${user_data_dir}/.pplx_login_ok" ] && [ "$FORCE_LOGIN" -eq 0 ]; then
+    ok "Sesion de Perplexity ya inicializada (${user_data_dir}/.pplx_login_ok)."
     return 0
   fi
   if ! python_deps_ok; then
@@ -98,8 +106,12 @@ login() {
     echo "       Ejecuta primero: ./setup.sh --mode local (o instala deps y repite)."
     return 1
   fi
-  step "Login guiado (una sola vez) - perfil: $user_data_dir"
-  "$PY" -m core_bridge.cli login --user-data-dir "$user_data_dir"
+  step "Login guiado (una sola vez) - perfil: ${user_data_dir:-por defecto de core_bridge}"
+  if [ "$FORCE_LOGIN" -eq 1 ]; then
+    "$PY" -m core_bridge.cli login --force
+  else
+    "$PY" -m core_bridge.cli login
+  fi
 }
 
 install_local_deps() {
@@ -159,8 +171,19 @@ if [ "$MODE" = "docker" ]; then
   mkdir -p profile
   add_docker_env_file
 
-  if ! login "${ROOT}/profile"; then
+  # El contenedor monta ./profile como PPLX_USER_DATA_DIR (/data/profile):
+  # el login del host debe escribir en ese mismo perfil. Se exporta solo
+  # durante el login y se restaura el valor previo del entorno.
+  find_python || true
+  SAVED_USER_DATA_DIR="${PPLX_USER_DATA_DIR:-}"
+  export PPLX_USER_DATA_DIR="${ROOT}/profile"
+  if ! login; then
     warn "El contenedor arrancara igualmente; sin login las consultas fallaran."
+  fi
+  if [ -n "$SAVED_USER_DATA_DIR" ]; then
+    export PPLX_USER_DATA_DIR="$SAVED_USER_DATA_DIR"
+  else
+    unset PPLX_USER_DATA_DIR
   fi
 
   step "Levantando contenedor (puerto ${PORT})"
@@ -187,10 +210,11 @@ fi
 
 # Modo local
 install_local_deps
-LOCAL_PROFILE="${ROOT}/tools/pplx_bridge/.profile"
-if ! login "$LOCAL_PROFILE"; then
+if ! login; then
   warn "Sin login el bridge arrancara pero Perplexity pedira autenticacion."
 fi
+LOCAL_PROFILE="$(bridge_profile_dir || true)"
+[ -n "$LOCAL_PROFILE" ] || LOCAL_PROFILE="(por defecto de core_bridge)"
 echo ""
 echo "Listo. Siguientes pasos (el bridge se arranca solo si hace falta):"
 echo "  1. Auditar:  python tools/run_pplx_audit.py --files src/engine/trie.py --prompt \"PUNTAJE: [X]/100 ...\""
