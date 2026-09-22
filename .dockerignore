@@ -1,0 +1,48 @@
+# Sesiones y datos de navegador (credentiales/cookies: nunca dentro de la imagen)
+.profile*/
+.profile/
+profile/
+chrome_data/
+tools/pplx_bridge/.profile/
+tools/pplx_bridge/chrome_data/
+**/.profile/
+**/.profile*/
+**/profile/
+**/chrome_data/
+cookies.json
+*.cookies.json
+storage_state.json
+credentials.json
+.env
+.env.*
+
+# VCS y CI
+.git/
+.gitignore
+.github/
+
+# Caches y artefactos
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+*.log
+logs/
+pplx_errors/
+*.png
+audit_result.txt
+pplx.html
+
+# Entornos y editor
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

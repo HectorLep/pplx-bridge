@@ -1,0 +1,23 @@
+services:
+  pplx-bridge:
+    build: .
+    image: pplx-bridge:latest
+    container_name: pplx-bridge
+    ports:
+      - "${PPLX_PORT:-8000}:8000"
+    environment:
+      PPLX_HOST: 0.0.0.0
+      PPLX_PORT: "8000"
+      PPLX_HEADLESS: "1"
+      PPLX_NO_SANDBOX: "1"
+      PPLX_USER_DATA_DIR: /data/profile
+      PPLX_TIMEOUT_S: "${PPLX_TIMEOUT_S:-180}"
+    volumes:
+      - ./profile:/data/profile
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
