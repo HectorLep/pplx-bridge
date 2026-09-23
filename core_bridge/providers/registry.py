@@ -18,9 +18,12 @@ Uso::
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "perplexity-web"
 
@@ -229,11 +232,23 @@ _registry_lock = threading.Lock()
 
 
 def build_default_registry() -> ProviderRegistry:
-    """Registro con los proveedores activos por defecto (web/perplexity)."""
+    """Registro con los proveedores activos (web + API con credenciales).
+
+    ``perplexity-web`` siempre esta y sigue siendo el modelo por defecto; los
+    modelos de Gemini se anaden solo cuando ``GEMINI_API_KEY`` esta presente
+    (entorno o ``.env``), de modo que ``GET /v1/models`` los liste sin pedir
+    la clave al arrancar.
+    """
     from .web.perplexity import PerplexityProvider  # perezoso: evita ciclos
 
     registry = ProviderRegistry()
     registry.register(PerplexityProvider(), default=True)
+    try:
+        from .api.gemini import register_gemini_providers
+
+        register_gemini_providers(registry)
+    except Exception as exc:  # pragma: no cover - nunca debe tumbar el puente
+        logger.warning("no se pudieron registrar los modelos Gemini: %s", exc)
     return registry
 
 

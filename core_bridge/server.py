@@ -238,10 +238,17 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
         "chat.completions provider=%s model=%s prompt_chars=%d",
         provider.name, model, len(prompt),
     )
+    chat = getattr(provider, "chat", None)
     try:
-        answer = await run_in_threadpool(
-            provider.ask, prompt, timeout_s=ASK_TIMEOUT_S
-        )
+        if callable(chat):
+            # Proveedores API (p. ej. Gemini) traducen el historial completo.
+            answer = await run_in_threadpool(
+                chat, req.messages, timeout_s=ASK_TIMEOUT_S
+            )
+        else:
+            answer = await run_in_threadpool(
+                provider.ask, prompt, timeout_s=ASK_TIMEOUT_S
+            )
     except Exception as exc:  # noqa: BLE001 - mapeado a HTTP explicito
         raise _bridge_failure(exc, where="chat.completions") from exc
 

@@ -7,6 +7,8 @@ La API del paquete es:
 - :func:`get_provider`: resuelve el proveedor por el campo ``model``.
 - :class:`BaseWebProvider` / :class:`PerplexityProvider`: backend web
   (Playwright) con perfiles y Circuit Breaker.
+- :class:`BaseApiProvider` / :class:`GeminiProvider`: backends REST (httpx);
+  Gemini se activa con ``GEMINI_API_KEY``.
 
 Uso::
 
@@ -16,6 +18,7 @@ Uso::
     print(provider.ask("Hola"))
 """
 
+from .api import BaseApiProvider, GeminiProvider
 from .base import BaseProvider, ProviderError
 from .registry import (
     DEFAULT_MODEL,
@@ -33,8 +36,10 @@ from .web import PERPLEXITY_MODEL, BaseWebProvider, PerplexityProvider
 __all__ = [
     "DEFAULT_MODEL",
     "PERPLEXITY_MODEL",
+    "BaseApiProvider",
     "BaseProvider",
     "BaseWebProvider",
+    "GeminiProvider",
     "PerplexityProvider",
     "ProviderError",
     "ProviderRegistry",

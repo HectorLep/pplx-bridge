@@ -12,6 +12,22 @@ from src.engine.trie import RadixTree, Trie
 DATA = Path(__file__).resolve().parent.parent / "data" / "dictionary_es.txt"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_api_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Aisla el registro global del entorno/.env real del desarrollador.
+
+    Sin esto, una ``GEMINI_API_KEY`` presente en la maquina (entorno o
+    ``.env``) cambiaria los modelos de ``build_default_registry()`` y haria
+    no deterministas las suites de providers.
+    """
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    try:
+        from core_bridge.providers import api as api_pkg
+    except ImportError:  # pragma: no cover - core_bridge opcional
+        return
+    monkeypatch.setattr(api_pkg.base, "default_dotenv_paths", lambda: ())
+
+
 def load_words() -> list[str]:
     """Lee el diccionario descartando comentarios y vacías."""
     return [
