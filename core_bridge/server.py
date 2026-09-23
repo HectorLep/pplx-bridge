@@ -2,12 +2,15 @@
 
 Endpoints:
 
-- ``GET /health``: estado del adaptador y del circuit breaker.
-- ``GET /v1/models``: modelo informativo ``perplexity-web``.
+- ``GET /health``: estado del proveedor por defecto y del circuit breaker.
+- ``GET /v1/models``: modelos activos registrados (formato OpenAI ``list``).
 - ``POST /v1/chat/completions``: formato estandar de mensajes OpenAI::
 
       {"model": "perplexity-web",
        "messages": [{"role": "user", "content": "Hola"}]}
+
+  El campo ``model`` se resuelve contra el registro de proveedores
+  (``core_bridge.providers``); ``perplexity-web`` es el modelo por defecto.
 
 - ``POST /v1/evaluate``: consulta generica con adjuntos nativos::
 
@@ -41,18 +44,26 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 try:
-    from core_bridge.adapter import BaseWebAdapter, get_adapter
     from core_bridge.browser import ASK_TIMEOUT_S, CircuitBreakerOpenError
+    from core_bridge.providers import (
+        DEFAULT_MODEL,
+        UnknownModelError,
+        get_provider,
+        get_registry,
+    )
 except ImportError:  # pragma: no cover - ejecucion directa dentro de core_bridge/
-    from adapter import BaseWebAdapter, get_adapter  # type: ignore[no-redef]
     from browser import ASK_TIMEOUT_S, CircuitBreakerOpenError  # type: ignore[no-redef]
+    from providers import (  # type: ignore[no-redef]
+        DEFAULT_MODEL,
+        UnknownModelError,
+        get_provider,
+        get_registry,
+    )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("core_bridge.server")
 
-DEFAULT_MODEL = "perplexity-web"
-
-app = FastAPI(title="core-bridge", version="1.0.0")
+app = FastAPI(title="core-bridge", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -85,7 +96,8 @@ class EvaluateRequest(BaseModel):
     - ``attachments``: rutas de archivos (relativas al CWD del servidor o
       absolutas) que se adjuntan de forma nativa en el navegador.
     - ``timeout_s``: timeout global opcional (por defecto 180s).
-    - ``model``: etiqueta informativa (no cambia el backend web).
+    - ``model``: proveedor a usar (se resuelve en el registro); por defecto
+      ``perplexity-web``.
     - ``prompt`` / ``files``: alias legacy de ``query`` / ``attachments``.
     """
 
@@ -135,6 +147,14 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _resolve_model(requested: str | None) -> str:
+    """Modelo efectivo: el pedido o, si viene vacio, el del registro."""
+    text = (requested or "").strip()
+    if text:
+        return text
+    return get_registry().default_model() or DEFAULT_MODEL
+
+
 def _resolve_evaluate_files(files: list[str]) -> list[str]:
     """Resuelve rutas de ``/v1/evaluate`` y valida existencia (422 si falla).
 
@@ -178,24 +198,22 @@ def _bridge_failure(exc: Exception, *, where: str) -> HTTPException:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """Estado del adaptador, navegador y circuit breaker (sin arrancar nada)."""
-    adapter: BaseWebAdapter = get_adapter()
-    return adapter.health()
+    """Estado del proveedor por defecto, navegador y circuit breaker."""
+    registry = get_registry()
+    try:
+        provider = registry.provider(None)
+    except UnknownModelError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    data = provider.health()
+    data.setdefault("default_model", registry.default_model())
+    data["models"] = registry.models()
+    return data
 
 
 @app.get("/v1/models")
 def list_models() -> dict[str, Any]:
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": DEFAULT_MODEL,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "core-bridge",
-            }
-        ],
-    }
+    """Modelos activos del registro de proveedores (formato OpenAI)."""
+    return {"object": "list", "data": get_registry().model_cards()}
 
 
 @app.post("/v1/chat/completions")
@@ -210,11 +228,19 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    logger.info("chat.completions model=%s prompt_chars=%d", req.model, len(prompt))
-    adapter = get_adapter()
+    model = _resolve_model(req.model)
+    try:
+        provider = get_provider(model)
+    except UnknownModelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    logger.info(
+        "chat.completions provider=%s model=%s prompt_chars=%d",
+        provider.name, model, len(prompt),
+    )
     try:
         answer = await run_in_threadpool(
-            adapter.ask, prompt, timeout_s=ASK_TIMEOUT_S
+            provider.ask, prompt, timeout_s=ASK_TIMEOUT_S
         )
     except Exception as exc:  # noqa: BLE001 - mapeado a HTTP explicito
         raise _bridge_failure(exc, where="chat.completions") from exc
@@ -228,7 +254,8 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
             "id": completion_id,
             "object": "chat.completion",
             "created": created,
-            "model": req.model or DEFAULT_MODEL,
+            "model": model,
+            "provider": provider.name,
             "choices": [
                 {
                     "index": 0,
@@ -264,14 +291,19 @@ async def evaluate(req: EvaluateRequest) -> JSONResponse:
     attachments = _resolve_evaluate_files(raw_attachments)
     timeout = ASK_TIMEOUT_S if req.timeout_s is None else float(req.timeout_s)
 
+    model = _resolve_model(req.model)
+    try:
+        provider = get_provider(model)
+    except UnknownModelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     logger.info(
-        "evaluate model=%s query_chars=%d attachments=%d timeout=%.0f",
-        req.model, len(query), len(attachments), timeout,
+        "evaluate provider=%s model=%s query_chars=%d attachments=%d timeout=%.0f",
+        provider.name, model, len(query), len(attachments), timeout,
     )
-    adapter = get_adapter()
     try:
         answer = await run_in_threadpool(
-            adapter.ask, query, attachments=attachments, timeout_s=timeout
+            provider.ask, query, attachments=attachments, timeout_s=timeout
         )
     except Exception as exc:  # noqa: BLE001 - mapeado a HTTP explicito
         raise _bridge_failure(exc, where="evaluate") from exc
@@ -283,7 +315,8 @@ async def evaluate(req: EvaluateRequest) -> JSONResponse:
             "id": evaluation_id,
             "object": "evaluation",
             "created": created,
-            "model": req.model or DEFAULT_MODEL,
+            "model": model,
+            "provider": provider.name,
             "query": query,
             "query_chars": len(query),
             "attachments": attachments,

@@ -1,111 +1,69 @@
-"""Adaptadores del puente web.
+"""Shims retrocompatibles del adaptador web.
 
-``BaseWebAdapter`` define el contrato abstracto y agnostico del backend:
+La implementacion vive ahora en ``core_bridge.providers``:
 
-- ``ask(query, attachments=...) -> response``
-- ``health() -> dict``
+- ``BaseWebAdapter`` -> :class:`core_bridge.providers.web.base.BaseWebProvider`
+- ``PerplexityAdapter`` -> :class:`core_bridge.providers.web.perplexity.PerplexityProvider`
+- ``get_adapter`` / ``set_adapter`` -> proveedor por defecto del registro
 
-``PerplexityAdapter`` es la implementacion concreta sobre Playwright. El
-vocabulario es generico (query / prompt / attachments / response): ningun
-caso de uso (auditoria, notas, rubricas...) vive en este paquete.
+Se conservan estos nombres para que scripts, ejemplos y clientes historicos
+sigan funcionando sin cambios.
 """
 
 from __future__ import annotations
 
-import threading
-from abc import ABC, abstractmethod
 from typing import Any
 
-from .browser import PerplexityBrowser, browser_health, get_browser
+from .providers.registry import (
+    DEFAULT_MODEL,
+    UnknownModelError,
+    get_registry,
+)
+from .providers.web.base import BaseWebProvider
+from .providers.web.perplexity import PerplexityProvider
+
+# Nombres legacy (alias exactos de las clases nuevas).
+BaseWebAdapter = BaseWebProvider
+PerplexityAdapter = PerplexityProvider
 
 
-class BaseWebAdapter(ABC):
-    """Interfaz abstracta de un backend web conversacional."""
-
-    name = "web"
-
-    @abstractmethod
-    def ask(
-        self,
-        query: str,
-        attachments: list[str] | None = None,
-        *,
-        timeout_s: float | None = None,
-    ) -> str:
-        """Envia *query* (con adjuntos opcionales) y devuelve la respuesta."""
-
-    @abstractmethod
-    def health(self) -> dict[str, Any]:
-        """Estado del adaptador sin lanzar trabajo (serializable)."""
-
-    def evaluate(
-        self,
-        query: str,
-        attachments: list[str] | None = None,
-        *,
-        timeout_s: float | None = None,
-    ) -> str:
-        """Alias generico de :meth:`ask` (compatibilidad con /v1/evaluate)."""
-        return self.ask(query, attachments=attachments, timeout_s=timeout_s)
+def get_adapter() -> Any:
+    """Adaptador/proveedor por defecto del proceso (compatibilidad)."""
+    return get_registry().provider(None)
 
 
-class PerplexityAdapter(BaseWebAdapter):
-    """Adaptador concreto: Perplexity web via Playwright (core_bridge.browser)."""
+def set_adapter(adapter: Any | None) -> None:
+    """Sustituye el proveedor por defecto (tests o backends alternos).
 
-    name = "perplexity"
+    Con ``None`` se restaura el :class:`PerplexityProvider` por defecto.
+    El proveedor entrante se registra tambien bajo ``perplexity-web`` para
+    que el despacho del servidor siga funcionando como antes.
+    """
+    registry = get_registry()
+    try:
+        current = registry.provider(None)
+    except UnknownModelError:
+        current = None
+    if current is not None and current is not adapter:
+        registry.unregister(current)
 
-    def __init__(self, browser: PerplexityBrowser | None = None) -> None:
-        self._browser = browser
+    if adapter is None:
+        registry.register(PerplexityProvider(), [DEFAULT_MODEL], default=True, replace=True)
+        return
 
-    @property
-    def browser(self) -> PerplexityBrowser:
-        """Navegador singleton (se arranca en la primera consulta)."""
-        if self._browser is None:
-            self._browser = get_browser()
-        return self._browser
-
-    def ask(
-        self,
-        query: str,
-        attachments: list[str] | None = None,
-        *,
-        timeout_s: float | None = None,
-    ) -> str:
-        text = (query or "").strip()
-        if not text:
-            raise ValueError("query vacia")
-        return self.browser.ask(
-            text, timeout_s=timeout_s, attachments=list(attachments or [])
-        )
-
-    def health(self) -> dict[str, Any]:
-        browser = self._browser
-        data = browser_health() if browser is None else browser.health()
-        return {"adapter": self.name, **data}
-
-
-_default_adapter: BaseWebAdapter | None = None
-_default_lock = threading.Lock()
-
-
-def get_adapter() -> BaseWebAdapter:
-    """Adaptador por defecto del proceso (PerplexityAdapter)."""
-    global _default_adapter
-    with _default_lock:
-        if _default_adapter is None:
-            _default_adapter = PerplexityAdapter()
-        return _default_adapter
-
-
-def set_adapter(adapter: BaseWebAdapter | None) -> None:
-    """Sustituye el adaptador por defecto (util para tests o backends alternos)."""
-    global _default_adapter
-    with _default_lock:
-        _default_adapter = adapter
+    models = [DEFAULT_MODEL]
+    lister = getattr(adapter, "list_models", None)
+    if callable(lister):
+        for model in lister():
+            text = str(model).strip()
+            if text and text not in models:
+                models.append(text)
+    registry.register(adapter, models, default=True, replace=True)
 
 
 __all__ = [
     "BaseWebAdapter",
+    "DEFAULT_MODEL",
     "PerplexityAdapter",
     "get_adapter",
     "set_adapter",
