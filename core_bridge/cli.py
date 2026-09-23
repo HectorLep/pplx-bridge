@@ -48,6 +48,18 @@ def _close_quietly(target) -> None:
         pass
 
 
+def _prompt(text: str) -> str:
+    """Muestra un prompt en la terminal y lee una linea.
+
+    ``input(prompt)`` puede retener el texto en el buffer de stdout (sobre
+    todo con la salida redirigida o capturada por el proceso padre), dejando
+    la consola aparentemente colgada. Se escribe con ``flush=True`` para
+    garantizar que el prompt sea visible antes de bloquear la lectura.
+    """
+    print(text, end="", flush=True)
+    return input()
+
+
 def _stop_playwright(pw) -> None:
     """Detiene el driver de Playwright sin propagar errores de tuberia.
 
@@ -140,9 +152,9 @@ def _cmd_login(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"[core_bridge] AVISO: no se pudo cargar {start_url}: {exc}")
         try:
-            input("[core_bridge] Pulsa ENTER cuando hayas iniciado sesion... ")
-            answer = input(
-                "[core_bridge] ¿Sesion iniciada correctamente? [s/N]: "
+            _prompt("[core_bridge] Pulsa ENTER cuando hayas iniciado sesion... ")
+            answer = _prompt(
+                "[core_bridge] ¿Sesion iniciada correctamente? [S/n]: "
             ).strip().lower()
         except EOFError:
             print(
@@ -169,7 +181,8 @@ def _cmd_login(args: argparse.Namespace) -> int:
         _close_quietly(context)
         _stop_playwright(pw)
 
-    if answer in {"s", "si", "sí", "y", "yes"}:
+    # ENTER (cadena vacia) confirma: la confirmacion es [S/n], no [s/N].
+    if answer in {"", "s", "si", "sí", "y", "yes"}:
         marker.write_text("ok\n", encoding="utf-8")
         print(f"[core_bridge] Sesion guardada. Marcador: {marker}")
         print(

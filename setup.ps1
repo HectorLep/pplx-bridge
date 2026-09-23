@@ -24,6 +24,7 @@ Set-Location -LiteralPath $Root
 $script:PyExe = $null
 $script:PyPre = @()
 $script:ComposePlugin = $true
+$script:LoginOk = $false
 
 function Write-Step([string]$Text) { Write-Host "`n==> $Text" -ForegroundColor Cyan }
 function Write-Ok([string]$Text) { Write-Host "[ok] $Text" -ForegroundColor Green }
@@ -154,18 +155,27 @@ function Invoke-Login {
     # Login guiado en el perfil efectivo del bridge. No impone rutas fijas:
     # 'python -m core_bridge.cli login' resuelve PPLX_USER_DATA_DIR o el
     # perfil aislado por navegador y escribe alli el marcador de sesion.
+    #
+    # No devuelve el resultado por el pipeline: esa funcion se invoca como
+    # sentencia suelta. En PowerShell, usar una funcion dentro de una
+    # condicion o asignarla (p. ej. 'if (-not (Invoke-Login))') captura TODA
+    # su salida y el proceso hijo deja de heredar la consola: los prompts de
+    # login no se ven en la terminal. Por eso el exito se comunica con
+    # $script:LoginOk y la llamada no captura stdin/stdout/stderr.
+    $script:LoginOk = $false
     $profileDir = Get-BridgeProfileDir
     if ($profileDir) {
         $marker = Join-Path $profileDir ".pplx_login_ok"
         if ((Test-Path -LiteralPath $marker) -and (-not $ForceLogin)) {
             Write-Ok "Sesion de Perplexity ya inicializada ($marker)."
-            return $true
+            $script:LoginOk = $true
+            return
         }
     }
     if (-not (Test-PythonDeps)) {
         Write-Warn2 "No hay Python+Playwright locales para abrir la ventana de login."
         Write-Host "        Ejecuta primero: .\setup.ps1 -Mode local (o instala deps y repite)."
-        return $false
+        return
     }
     if ($profileDir) {
         Write-Step "Login guiado (una sola vez) - perfil: $profileDir"
@@ -179,9 +189,9 @@ function Invoke-Login {
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Warn2 "Login no confirmado. Puedes repetirlo con: python -m core_bridge.cli login"
-        return $false
+        return
     }
-    return $true
+    $script:LoginOk = $true
 }
 
 function Install-LocalDeps {
@@ -263,7 +273,10 @@ if ($Mode -eq "docker") {
         $savedUserDataDir = $env:PPLX_USER_DATA_DIR
         $env:PPLX_USER_DATA_DIR = (Join-Path $Root "profile")
         try {
-            if (-not (Invoke-Login)) {
+            # Sentencia suelta (sin 'if' ni asignacion): asi el proceso de
+            # login hereda la consola y sus prompts son visibles.
+            Invoke-Login
+            if (-not $script:LoginOk) {
                 Write-Warn2 "El contenedor arrancara igualmente; sin login las consultas a Perplexity fallaran."
             }
         } finally {
@@ -292,7 +305,10 @@ if ($Mode -eq "docker") {
 # Modo local
 Write-Step "Modo local"
 Install-LocalDeps
-if (-not (Invoke-Login)) {
+# Sentencia suelta (sin 'if' ni asignacion): asi el proceso de login hereda
+# la consola y sus prompts son visibles.
+Invoke-Login
+if (-not $script:LoginOk) {
     Write-Warn2 "Sin login el bridge arrancara pero Perplexity pedira autenticacion."
 }
 $localProfile = Get-BridgeProfileDir
